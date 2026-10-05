@@ -21,7 +21,8 @@ addresses must agree. A name behind a CDN may legitimately return a different
 address each time; the harness compares the *set of authoritative nameservers*
 you ended at for those, not the address.
 """
-import argparse, subprocess, sys
+import argparse, subprocess, sys, shutil
+import dns.name, dns.message, dns.query, dns.flags, dns.rdatatype, dns.rcode
 
 # Root servers. Everything starts here; there is no earlier step.
 ROOT_SERVERS = [
@@ -43,47 +44,126 @@ VERIFY_NAMES = [
 
 
 class Resolver:
-    """Your iterative resolver.
+    """IPv4 iterative resolver; RD is cleared on every transport query."""
 
-    The whole point is that you never ask a server to recurse for you.
-    You ask one server, it says "not mine, ask over there", and you go there.
-
-    Suggested shape - but it is yours to design:
-
-        resolve(name) -> (address, path)
-            address : the A record you ended up with, as a string
-            path    : the servers you asked, in order, so you can show your work
-
-    Things you will hit, in roughly this order:
-
-    1.  A delegation gives you NS *names*, sometimes with glue A records and
-        sometimes without. No glue means you have to resolve that nameserver's
-        name first - which is another walk. Decide what you do there.
-    2.  A server may not answer. Try the next one rather than giving up.
-    3.  CNAMEs. The answer you get back may be a different name than the one
-        you asked for, and you have to start again with that name.
-    4.  Loops. Cap your depth.
-
-    If you shell out to dig, the flag you want is `+norecurse`, so that the
-    server you ask replies with a delegation instead of doing the work:
-
-        dig @198.41.0.4 www.korea.ac.kr +norecurse
-    """
+    def __init__(self, timeout=1.5, max_depth=24, max_queries=150):
+        self.timeout, self.max_depth, self.max_queries = timeout, max_depth, max_queries
+        self.path, self.events, self.glueless = [], [], []
+        self._ns_cache = {}
 
     def resolve(self, name):
-        raise NotImplementedError(
-            "Implement the iterative walk: root -> TLD -> authoritative")
+        self.path, self.events, self.glueless = [], [], []
+        self._ns_cache = {}
+        result = self._walk(dns.name.from_text(name).canonicalize(), 0, frozenset())
+        return result, list(self.path)
+
+    def _ask(self, name, server):
+        if len(self.path) >= self.max_queries:
+            raise RuntimeError("global DNS query budget exceeded")
+        self.path.append(server)
+        q = dns.message.make_query(name, "A")
+        q.flags &= ~dns.flags.RD
+        event = {"name": name.to_text(), "server": server, "id": q.id, "rd": False}
+        self.events.append(event)
+        try:
+            response = dns.query.udp(q, server, timeout=self.timeout)
+            if response.flags & dns.flags.TC:
+                response = dns.query.tcp(q, server, timeout=self.timeout)
+                event["tcp_fallback"] = True
+            event.update(rcode=dns.rcode.to_text(response.rcode()),
+                         aa=bool(response.flags & dns.flags.AA),
+                         answer=[r.to_text() for r in response.answer],
+                         authority=[r.to_text() for r in response.authority],
+                         additional=[r.to_text() for r in response.additional],
+                         dns_bytes=len(response.to_wire()))
+            return response
+        except Exception as exc:
+            event["error"] = f"{type(exc).__name__}: {exc}"
+            raise
+
+    def _walk(self, name, depth, active):
+        if depth >= self.max_depth or name in active:
+            raise RuntimeError("CNAME/NS cycle or recursion depth exceeded")
+        active = active | {name}
+        servers = list(ROOT_SERVERS)
+        visited = set()
+        zone = dns.name.root
+        for _ in range(self.max_depth - depth):
+            referral = None
+            for server in servers:
+                key = (name, server)
+                if key in visited:
+                    continue
+                visited.add(key)
+                try:
+                    response = self._ask(name, server)
+                except Exception:
+                    if len(self.path) >= self.max_queries:
+                        raise RuntimeError("global DNS query budget exceeded")
+                    continue
+                if response.rcode() == dns.rcode.NXDOMAIN and response.flags & dns.flags.AA:
+                    raise LookupError(f"authoritative NXDOMAIN: {name}")
+                if response.rcode() != dns.rcode.NOERROR:
+                    continue
+                # Follow an alias with a fresh root walk, even if target A is supplied.
+                for rr in response.answer:
+                    if rr.name == name and rr.rdtype == dns.rdatatype.CNAME:
+                        return self._walk(rr[0].target.canonicalize(), depth + 1, active)
+                if response.flags & dns.flags.AA:
+                    for rr in response.answer:
+                        if rr.name == name and rr.rdtype == dns.rdatatype.A:
+                            return rr[0].address
+                    if any(rr.rdtype == dns.rdatatype.SOA for rr in response.authority):
+                        raise LookupError(f"authoritative NODATA (A): {name}")
+                delegations = [rr for rr in response.authority
+                               if rr.rdtype == dns.rdatatype.NS and name.is_subdomain(rr.name)
+                               and rr.name != zone and rr.name.is_subdomain(zone)]
+                if delegations:
+                    referral = (response, max(delegations, key=lambda rr: len(rr.name.labels)))
+                    break
+            if referral is None:
+                raise RuntimeError(f"no usable response for {name} at zone {zone}")
+            response, ns_rr = referral
+            zone = ns_rr.name
+            ns_names = [r.target.canonicalize() for r in ns_rr]
+            servers = []
+            # Accept only addresses for the named NS, including root sibling glue.
+            for rr in response.additional:
+                if rr.rdtype == dns.rdatatype.A and rr.name in ns_names:
+                    servers.extend(r.address for r in rr)
+            if not servers:
+                for ns in ns_names:
+                    before = len(self.path)
+                    try:
+                        if ns not in self._ns_cache:
+                            self._ns_cache[ns] = self._walk(ns, depth + 1, active)
+                        servers.append(self._ns_cache[ns])
+                    except (RuntimeError, LookupError):
+                        continue
+                    finally:
+                        self.glueless.append({"zone": str(zone), "nameserver": str(ns),
+                                              "extra_queries": len(self.path)-before})
+                if not servers:
+                    raise RuntimeError(f"no IPv4 nameserver address for {zone}")
+            servers = list(dict.fromkeys(servers))
+        raise RuntimeError("delegation depth exceeded")
 
 
 # ------------------------------------------------------------------- harness
 def dig_answer(name):
     """What the system resolver says, for comparison."""
+    if not shutil.which("dig"):
+        import dns.resolver
+        return [r.address for r in dns.resolver.resolve(name, "A")]
     out = subprocess.run(["dig", "+short", name, "A"],
                          capture_output=True, text=True).stdout
     return [l for l in out.split() if l and l[0].isdigit()]
 
 
 def verify():
+    if not shutil.which("dig"):
+        print("Reference: dnspython system recursive resolver (dig is not installed).")
+        print("The iterative implementation itself never uses this recursive reference.")
     r, failures = Resolver(), 0
     for name, kind in VERIFY_NAMES:
         try:
@@ -104,7 +184,7 @@ def verify():
             note = "  <- should have matched"
             failures += 1
         print(f"  {'FAIL' if note.endswith('matched') else 'ok  '}  {name:<22} "
-              f"you={addr:<16} dig={','.join(expected) or '-'}   "
+              f"you={addr:<16} reference={','.join(expected) or '-'}   "
               f"hops={len(path)}{note}")
     print(f"\n  {len(VERIFY_NAMES) - failures}/{len(VERIFY_NAMES)} ok")
     return 1 if failures else 0
@@ -127,3 +207,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

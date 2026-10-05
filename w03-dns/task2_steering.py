@@ -76,43 +76,85 @@ RESOLVERS = {
 }
 
 
-def dig(name, rtype="A", server=None):
-    """Raw lookup. Transport only - the thinking is yours."""
-    args = ["dig", "+short", name, rtype]
+def query_chain(site, server, source_ip=None):
+    import dns.resolver, dns.rdatatype
+    import time
+    resolver = dns.resolver.Resolver(configure=True)
     if server:
-        args.insert(1, f"@{server}")
-    out = subprocess.run(args, capture_output=True, text=True).stdout
-    return [l.strip() for l in out.splitlines() if l.strip()]
+        resolver.nameservers = [server]
+    resolver.timeout = 2
+    resolver.lifetime = 5
+    current = site.rstrip(".").lower()
+    chain, records, seen = [], [], set()
+    started = time.perf_counter()
+    try:
+        for _ in range(20):
+            if current in seen:
+                raise RuntimeError("CNAME cycle")
+            seen.add(current)
+            response = resolver.resolve(current, "CNAME", raise_on_no_answer=False, source=source_ip)
+            records.append({"query": current, "type": "CNAME",
+                            "response": response.response.to_text()})
+            if response.rrset is None:
+                break
+            target = response.rrset[0].target.to_text().rstrip(".").lower()
+            chain.append({"from": current, "to": target, "ttl": response.rrset.ttl})
+            current = target
+        else:
+            raise RuntimeError("CNAME depth exceeded")
+        answer = resolver.resolve(current, "A", source=source_ip)
+        records.append({"query": current, "type": "A", "response": answer.response.to_text()})
+        return {"status": "ok", "resolver_ips": resolver.nameservers, "source_ip": source_ip,
+                "server_used": str(answer.nameserver), "chain": chain,
+                "final_name": current, "addresses": sorted({r.address for r in answer}),
+                "ttl": answer.rrset.ttl, "elapsed_ms": round((time.perf_counter()-started)*1000,2),
+                "raw": records}
+    except Exception as exc:
+        return {"status": "error", "resolver_ips": resolver.nameservers, "chain": chain,
+                "final_name": current, "addresses": [], "error": f"{type(exc).__name__}: {exc}",
+                "raw": records}
 
 
-def collect():
-    """Gather raw chains and per-resolver answers into out/chains.json.
-
-    You write this. Roughly:
-      for each site: follow CNAMEs to the end, then for each resolver in
-      RESOLVERS record the A records it returns.
-    """
-    raise NotImplementedError("build the collector")
+def collect(label="network-1", source_ip=None, system_dns=None):
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime, timezone
+    path = os.path.join(OUT, "chains.json")
+    data = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
+    timestamp = datetime.now(timezone.utc).isoformat()
+    jobs = [(site, key, system_dns if key == "system" and system_dns else server)
+            for site in SITES for key, server in RESOLVERS.items()]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        values = list(pool.map(lambda job: query_chain(job[0], job[2], source_ip), jobs))
+    for (site, key, _), result in zip(jobs, values):
+        entry = data.setdefault(site, {"networks": {}})
+        network = entry["networks"].setdefault(label, {"collected_at_utc": timestamp,"resolvers": {}})
+        network["collected_at_utc"] = timestamp
+        network["source_ip"] = source_ip
+        network["resolvers"][key] = result
+        print(label, site, key, result["status"], ",".join(result["addresses"]))
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+    return data
 
 
 def report():
-    """Read out/chains.json and produce out/report.md.
-
-    You write this too - including the classification rule that decides
-    whether a site is on a third-party CDN.
-    """
-    raise NotImplementedError("build the report")
+    from report_builder import build
+    return build()
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--collect", action="store_true")
     p.add_argument("--report", action="store_true")
+    p.add_argument("--label", default="network-1", help="Actual network name; switch network before collecting again")
+    p.add_argument("--source-ip", help="Bind queries to the measured interface IPv4 address")
+    p.add_argument("--system-dns", help="DNS IPv4 configured on that interface, useful with multiple adapters")
     a = p.parse_args()
     os.makedirs(OUT, exist_ok=True)
     if a.collect:
-        collect()
+        collect(a.label, a.source_ip, a.system_dns)
     elif a.report:
         report()
     else:
         p.print_help()
+
