@@ -53,12 +53,25 @@ class YourControl:
       That distinction has a name in the textbook.
     """
 
+    BETA = 0.7      # multiplicative decrease: keep 70% (CUBIC's beta), not Reno's 50%
+
     def __init__(self):
-        self.window = 1
-        raise NotImplementedError("write your congestion control")
+        self.window = 1.0
+        self.ssthresh = float("inf")    # slow start until the network says stop
+        self.acks_since_cut = 0
 
     def on_ack(self):
-        raise NotImplementedError
+        self.acks_since_cut += 1
+        if self.window < self.ssthresh:
+            self.window += 1                    # slow start: doubles every RTT
+        else:
+            self.window += 1 / self.window      # congestion avoidance: +1 per RTT
 
     def on_loss(self):
-        raise NotImplementedError
+        # One tail-drop burst times out as many separate losses. React once per
+        # window of data, like Reno's fast recovery, instead of once per packet.
+        if self.acks_since_cut < self.window and self.ssthresh != float("inf"):
+            return
+        self.ssthresh = max(2.0, self.window * self.BETA)
+        self.window = self.ssthresh
+        self.acks_since_cut = 0

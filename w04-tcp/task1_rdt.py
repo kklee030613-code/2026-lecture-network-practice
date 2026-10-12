@@ -67,26 +67,83 @@ class Sender:
     why in observation.md.
     """
 
+    # Selective repeat: a window of packets in flight, one timer per packet,
+    # and only the packets that are actually missing get resent.
+    WINDOW = 16         # packets in flight at most
+    TIMEOUT = 6         # steps before an unacknowledged packet is resent
+
     def __init__(self, data_channel, ack_channel, data):
-        raise NotImplementedError("write your sender")
+        self.data_ch, self.ack_ch = data_channel, ack_channel
+        # R1: PAYLOAD-sized pieces, numbered 0..n-1
+        self.chunks = [data[i:i + PAYLOAD] for i in range(0, len(data), PAYLOAD)]
+        self.base = 0           # lowest seq not yet acknowledged
+        self.acked = set()      # seqs acknowledged, in or above the window
+        self.sent_at = {}       # seq -> step it was last (re)sent
+        self.now = 0
 
     def step(self):
         """Do one unit of work. Return False when you believe you are done."""
-        raise NotImplementedError
+        self.now += 1
+
+        # Read every ACK that has arrived. Each is (cumulative, seq): the
+        # receiver has everything below `cumulative`, and also has `seq`.
+        while (ack := self.ack_ch.receive()) is not None:
+            kind, cum, seq = ack
+            if kind != "ACK":
+                continue
+            # Duplicate or stale ACKs are harmless: they only ever add to
+            # `acked`, and a number we already know adds nothing (R3).
+            if 0 <= seq < len(self.chunks):
+                self.acked.add(seq)
+            while self.base < min(cum, len(self.chunks)):
+                self.acked.add(self.base)
+                self.base += 1
+            while self.base in self.acked:
+                self.base += 1
+
+        if self.base >= len(self.chunks):
+            return False        # every piece acknowledged
+
+        # Send new packets and resend timed-out ones, within the window (R4).
+        for seq in range(self.base, min(self.base + self.WINDOW, len(self.chunks))):
+            if seq in self.acked:
+                continue
+            last = self.sent_at.get(seq)
+            if last is None or self.now - last >= self.TIMEOUT:
+                self.data_ch.send(("DATA", seq, self.chunks[seq]))
+                self.sent_at[seq] = self.now
+        return True
 
 
 class Receiver:
     """Your receiver. Hands back the reassembled bytes via `.data()`."""
 
     def __init__(self, data_channel, ack_channel):
-        raise NotImplementedError("write your receiver")
+        self.data_ch, self.ack_ch = data_channel, ack_channel
+        self.expected = 0       # next seq to append to the output
+        self.buffer = {}        # out-of-order pieces, seq -> payload
+        self.out = bytearray()
 
     def step(self):
-        raise NotImplementedError
+        while (pkt := self.data_ch.receive()) is not None:
+            kind, seq, payload = pkt
+            if kind != "DATA":
+                continue
+            # R3: a duplicate is either already in the output (seq < expected)
+            # or already buffered. Either way it is dropped, not appended twice.
+            if seq >= self.expected and seq not in self.buffer:
+                self.buffer[seq] = payload
+            # R2: append only the contiguous run starting at `expected`.
+            while self.expected in self.buffer:
+                self.out += self.buffer.pop(self.expected)
+                self.expected += 1
+            # Always ACK, duplicates included: the duplicate usually means our
+            # previous ACK was lost, and silence would make the sender retry forever.
+            self.ack_ch.send(("ACK", self.expected, seq))
 
     def data(self):
         """The bytes reassembled so far."""
-        raise NotImplementedError
+        return bytes(self.out)
 
 
 # ------------------------------------------------------------------- harness
