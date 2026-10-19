@@ -16,31 +16,6 @@ exactly the thing you are supposed to understand this week.
 import argparse
 
 
-def _parse_address(address):
-    if not isinstance(address, str):
-        raise ValueError("IPv4 address must be a string")
-    parts = address.split(".")
-    if len(parts) != 4:
-        raise ValueError("IPv4 address must have four octets")
-    value = 0
-    for part in parts:
-        if not part or not part.isascii() or not part.isdecimal():
-            raise ValueError("Invalid IPv4 octet")
-        octet = int(part)
-        if not 0 <= octet <= 255:
-            raise ValueError("IPv4 octet outside 0-255")
-        value = (value << 8) | octet
-    return value
-
-
-def _format_address(value):
-    return ".".join(str((value >> shift) & 255) for shift in (24, 16, 8, 0))
-
-
-def _mask(prefix):
-    return (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
-
-
 def parse_cidr(cidr):
     """'163.152.6.0/24' -> (network as int, prefix length).
 
@@ -49,32 +24,52 @@ def parse_cidr(cidr):
     common way to write a host, but it is not a network).
     """
     if not isinstance(cidr, str) or cidr.count("/") != 1:
-        raise ValueError("Expected address/prefix")
-    address, length = cidr.split("/")
-    if not length or not length.isascii() or not length.isdecimal():
-        raise ValueError("Invalid prefix length")
-    prefix = int(length)
-    if not 0 <= prefix <= 32:
-        raise ValueError("Prefix length outside 0-32")
-    network = _parse_address(address)
-    if network & (~_mask(prefix) & 0xFFFFFFFF):
-        raise ValueError("Network address has host bits set")
-    return network, prefix
+        raise ValueError(f"not a CIDR block: {cidr!r}")
+    addr, plen = cidr.split("/")
+    if not plen.isdigit() or not 0 <= int(plen) <= 32:
+        raise ValueError(f"prefix length must be 0-32: {cidr!r}")
+    plen = int(plen)
+    net = to_int(addr)
+    if net & ~mask(plen) & 0xFFFFFFFF:
+        raise ValueError(f"host bits set: {cidr!r} (network is "
+                         f"{to_str(net & mask(plen))}/{plen})")
+    return net, plen
+
+
+def to_int(dotted):
+    """'163.152.6.0' -> 2744649216. Four decimal octets, each 0-255."""
+    parts = dotted.split(".")
+    if len(parts) != 4 or not all(p.isdigit() and int(p) <= 255 for p in parts):
+        raise ValueError(f"not an IPv4 address: {dotted!r}")
+    n = 0
+    for p in parts:
+        n = (n << 8) | int(p)
+    return n
+
+
+def to_str(n):
+    """2744649216 -> '163.152.6.0'."""
+    return ".".join(str((n >> shift) & 0xFF) for shift in (24, 16, 8, 0))
+
+
+def mask(plen):
+    """/24 -> 0xFFFFFF00. /0 -> 0."""
+    return (0xFFFFFFFF << (32 - plen)) & 0xFFFFFFFF
 
 
 def network_range(cidr):
-    """'163.152.6.0/24' -> (first usable, last usable, broadcast) as strings (or None for absent usable hosts).
+    """'163.152.6.0/24' -> (first usable, last usable, broadcast) as strings.
 
     Careful at the edges. /31 and /32 do not have a usable host range in the
     ordinary sense - decide what you return and say so in observation.md.
     """
-    network, prefix = parse_cidr(cidr)
-    broadcast = network | (~_mask(prefix) & 0xFFFFFFFF)
-    # Traditional network/broadcast exclusion: no usable hosts for /31 or /32.
-    if prefix >= 31:
-        return None, None, _format_address(broadcast)
-    return (_format_address(network + 1), _format_address(broadcast - 1),
-            _format_address(broadcast))
+    net, plen = parse_cidr(cidr)
+    bcast = net | (~mask(plen) & 0xFFFFFFFF)
+    if plen == 32:          # one host, no network or broadcast address
+        return to_str(net), to_str(net), to_str(net)
+    if plen == 31:          # RFC 3021 point-to-point: both are hosts, no broadcast
+        return to_str(net), to_str(bcast), to_str(bcast)
+    return to_str(net + 1), to_str(bcast - 1), to_str(bcast)
 
 
 class ForwardingTable:
@@ -83,28 +78,27 @@ class ForwardingTable:
     add(cidr, next_hop)  ·  lookup(address) -> next_hop or None
 
     The default route 0.0.0.0/0 matches everything and is the shortest prefix,
-    so it must lose to any other match. If two entries have the same network and prefix
+    so it must lose to any other match. If two entries have the same prefix
     length, the table is malformed - say what you do.
     """
 
     def __init__(self):
-        self._routes = {}
+        self.routes = {}        # (network, prefix length) -> next hop
 
     def add(self, cidr, next_hop):
-        key = parse_cidr(cidr)
-        if key in self._routes and self._routes[key] != next_hop:
-            raise ValueError("Conflicting next hops for the same prefix")
-        self._routes[key] = next_hop
+        # The same prefix twice is a replacement, not a second entry: the
+        # later add wins, as `ip route replace` does. Two *different*
+        # prefixes of the same length can never both match one address.
+        self.routes[parse_cidr(cidr)] = next_hop
 
     def lookup(self, address):
-        destination = _parse_address(address)
-        best_prefix = -1
-        best_hop = None
-        for (network, prefix), hop in self._routes.items():
-            if prefix > best_prefix and destination & _mask(prefix) == network:
-                best_prefix = prefix
-                best_hop = hop
+        addr = to_int(address)
+        best_len, best_hop = -1, None
+        for (net, plen), hop in self.routes.items():
+            if addr & mask(plen) == net and plen > best_len:
+                best_len, best_hop = plen, hop
         return best_hop
+
 
 # ------------------------------------------------------------------- harness
 RANGE_CASES = [
@@ -169,4 +163,3 @@ if __name__ == "__main__":
     p.add_argument("--verify", action="store_true")
     a = p.parse_args()
     raise SystemExit(verify() if a.verify else p.print_help())
-

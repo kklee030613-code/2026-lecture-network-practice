@@ -54,11 +54,48 @@ class YourTable:
     Say which you chose and what it cost you in memory.
     """
 
+    # Group by prefix length, then go one step further: controlled prefix
+    # expansion. Every prefix of length 17-24 is rewritten as the /24s it
+    # covers, and every prefix of length 1-16 as the /16s it covers. Then a
+    # lookup is at most two dict probes - one for the /24 the address is in,
+    # one for its /16 - plus the rare /25-/32 and the default route.
+    #
+    # Expansion must not let a shorter prefix overwrite a longer one, so
+    # `_len24` / `_len16` remember the length that filled each slot. They are
+    # only used while building; lookup touches the hop dicts alone.
+
     def __init__(self):
-        raise NotImplementedError("write your table")
+        self.t24, self._len24 = {}, {}     # addr >> 8  -> next hop, lengths 17-24
+        self.t16, self._len16 = {}, {}     # addr >> 16 -> next hop, lengths 1-16
+        self.long = {}          # prefix_len 25-32 -> {network: next_hop}
+        self.default = None     # 0.0.0.0/0
 
     def add(self, network, prefix_len, next_hop):
-        raise NotImplementedError
+        if prefix_len == 0:
+            if self.default is None:
+                self.default = next_hop
+        elif prefix_len > 24:
+            self.long.setdefault(prefix_len, {}).setdefault(network, next_hop)
+        else:
+            if prefix_len > 16:
+                hops, lens, width = self.t24, self._len24, 24
+            else:
+                hops, lens, width = self.t16, self._len16, 16
+            first = network >> (32 - width)
+            for slot in range(first, first + (1 << (width - prefix_len))):
+                # Strictly longer wins; on a tie the first add keeps the slot,
+                # which is what LinearTable does with a duplicate prefix.
+                if lens.get(slot, -1) < prefix_len:
+                    lens[slot] = prefix_len
+                    hops[slot] = next_hop
 
     def lookup(self, address):
-        raise NotImplementedError
+        if self.long:           # empty in most tables, so this costs one test
+            for plen in sorted(self.long, reverse=True):
+                hop = self.long[plen].get(address & ((0xFFFFFFFF << (32 - plen)) & 0xFFFFFFFF))
+                if hop is not None:
+                    return hop
+        hop = self.t24.get(address >> 8)
+        if hop is None:
+            hop = self.t16.get(address >> 16, self.default)
+        return hop
