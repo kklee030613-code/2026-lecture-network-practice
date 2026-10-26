@@ -13,7 +13,7 @@ in the packet. Build it.
 
     python3 task1_linkstate.py --verify
 """
-import argparse
+import argparse, heapq
 
 # Undirected weighted graph: node -> {neighbour: cost}
 TOPOLOGY = {
@@ -33,7 +33,38 @@ def dijkstra(graph, source):
 
     You write the loop. `heapq` is allowed; `networkx` is not.
     """
-    raise NotImplementedError("implement Dijkstra")
+    return {n: c for n, (c, _) in _spf(graph, source).items() if n != source}
+
+
+def _spf(graph, source):
+    """Dijkstra that also remembers, for every node, the set of first hops
+    that reach it at the shortest cost. {node: (cost, frozenset(first_hops))}
+
+    Equal-cost paths are kept, not thrown away: when a second path arrives
+    with the same cost, its first hops are added to the set. That set is the
+    ECMP group a real router would install.
+    """
+    best = {source: (0, frozenset())}
+    done = set()
+    pq = [(0, source)]
+    while pq:
+        cost, node = heapq.heappop(pq)
+        if node in done:
+            continue
+        done.add(node)
+        hops = best[node][1]
+        for nbr, w in graph.get(node, {}).items():
+            if nbr in done:
+                continue
+            via = frozenset([nbr]) if node == source else hops
+            new = cost + w
+            old = best.get(nbr)
+            if old is None or new < old[0]:
+                best[nbr] = (new, via)
+                heapq.heappush(pq, (new, nbr))
+            elif new == old[0]:
+                best[nbr] = (new, old[1] | via)     # a tie: keep both
+    return best
 
 
 def forwarding_table(graph, source):
@@ -48,7 +79,12 @@ def forwarding_table(graph, source):
     works, but think about what a router does when two shortest paths tie, and
     pick a rule. Say which in observation.md.
     """
-    raise NotImplementedError("implement the forwarding table")
+    # Tie rule: of all first hops that lie on *some* shortest path, install
+    # the one whose name sorts first. Deterministic, so every run and every
+    # router builds the same table; a real router would install all of them
+    # (ECMP) and hash flows across them.
+    return {dest: min(hops) for dest, (_, hops) in _spf(graph, source).items()
+            if dest != source and hops}
 
 
 def link_down(graph, a, b):

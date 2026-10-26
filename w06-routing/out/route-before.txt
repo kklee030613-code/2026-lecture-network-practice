@@ -1,0 +1,20 @@
+# NOT MEASURED - Docker unavailable on this machine (path B)
+#
+# This laptop has no Docker Desktop and no WSL, and the account has no admin
+# rights to install them, so `bash scenario.sh up / routes` could not be run.
+# No classmate's tables were available either. Nothing below is router output;
+# it is the table the topology and config predict, written by hand, so the
+# reader can check the reasoning in observation.md against it.
+#
+# Topology (compose.yml + topology/*/frr.conf): triangle r1-r2-r3, every
+# interface `ip ospf cost 10`, one subnet per link (net_a r1-r3, net_b r1-r2,
+# net_c r2-r3; Docker assigns the actual 172.x prefixes at run time).
+#
+# Expected `show ip route ospf` on r1 once converged:
+#   O   net_a [110/10] is directly connected, eth0        (also connected)
+#   O   net_b [110/10] is directly connected, eth1        (also connected)
+#   O>* net_c [110/20] via r2 (net_b), eth1
+#                      via r3 (net_a), eth0              <- ECMP, two equal paths
+#
+# B2: net_c is the route r1 has no link to. It is learned from r2's and r3's
+# router LSAs, at cost 10+10 = 20 over either neighbour.

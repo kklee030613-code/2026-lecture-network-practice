@@ -1,0 +1,16 @@
+# NOT MEASURED - Docker unavailable on this machine (path B). See route-before.txt.
+#
+# Predicted from the config (no hello/dead set -> FRR defaults: hello 10 s,
+# dead 40 s, broadcast network type on the Docker bridge):
+#
+#   cut,  measured at r1 (the side whose interface went down):  ~1-2 s
+#         r1 sees its own link drop at once -> adjacency torn down, new
+#         router LSA, SPF (FRR throttle: 0 ms initial, 50 ms hold). The
+#         scenario's 1 s polling loop would report 1 s.
+#   cut,  at r2 (the far side, its veth stays up on the bridge):  up to 40 s
+#         r2 only learns r1 is gone when no hello arrives for the dead interval.
+#   restore:                                                     ~1-10 s+
+#         must wait for the next hello (<= 10 s), then 2-Way, DR/BDR, ExStart,
+#         Exchange, Loading, Full, before the link is advertised again.
+#   cost change (Part C):                                        < 1 s
+#         no detection needed: new router LSA floods immediately, SPF runs.

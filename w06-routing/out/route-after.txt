@@ -1,0 +1,6 @@
+# NOT MEASURED - Docker unavailable on this machine (path B). See route-before.txt.
+#
+# Expected r1 table after `ip link set eth1 down` on r1 (net_b, r1-r2 cut):
+#   O   net_a [110/10] is directly connected, eth0
+#   O>* net_b [110/20] via r3 (net_a), eth0      <- r1-r2 subnet now reached the long way
+#   O>* net_c [110/20] via r3 (net_a), eth0      <- ECMP group shrinks from 2 to 1

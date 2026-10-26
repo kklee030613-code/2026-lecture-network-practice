@@ -87,8 +87,115 @@ class YourRouter:
     on the event where it happens.
     """
 
+    # What is kept between events: `dist`, the shortest cost to every node.
+    # From `dist` and the graph alone the table can be rebuilt in one O(E)
+    # pass, with exactly dijkstra_table's tie-breaking (see _table_from_dist),
+    # so most events never need SPF at all:
+    #
+    #   * link down / cost up on a link that is not tight (not on any
+    #     shortest path): nothing changes.
+    #   * link down / cost up on a tight link a->b: if b still has another
+    #     tight predecessor, no distance changes - only a tie may move, and
+    #     the O(E) rebuild handles that. Otherwise distances grow: full SPF.
+    #   * link up / cost down: if it does not make anything strictly shorter
+    #     (checked against `dist`), at most a tie appears: O(E) rebuild.
+    #     If it does, the new distances are pushed outwards from the cheaper
+    #     end with a decrease-only relaxation that touches just the nodes
+    #     that actually improve - not a full SPF.
+
     def __init__(self, graph, source):
-        raise NotImplementedError("write your router")
+        self.graph = {n: dict(e) for n, e in graph.items()}
+        self.source = source
+        self._full()
+
+    def _full(self):
+        """Recompute the world. Counted once, via dijkstra_table()."""
+        self.table = dijkstra_table(self.graph, self.source)
+        # The same SPF also yields the distances; dijkstra_table just does not
+        # return them. Recovering them here is part of the run counted above,
+        # not a second one - a real router's SPF produces both at once.
+        dist, pq = {self.source: 0}, [(0, self.source)]
+        while pq:
+            d, n = heapq.heappop(pq)
+            if d > dist[n]:
+                continue
+            for m, w in self.graph[n].items():
+                if d + w < dist.get(m, float("inf")):
+                    dist[m] = d + w
+                    heapq.heappush(pq, (d + w, m))
+        self.dist = dist
+
+    def _table_from_dist(self):
+        """dijkstra_table's answer, computed from distances without SPF.
+
+        dijkstra_table finalises nodes in (cost, name) order and only replaces
+        a tentative route on a strictly cheaper one. So a node's first hop is
+        inherited from its tight predecessor that was finalised first: the one
+        with the smallest (dist, name). The source finalises first of all, so
+        a neighbour reachable at its direct cost is its own first hop.
+        """
+        dist, g, src = self.dist, self.graph, self.source
+        table = {}
+        for node in sorted(dist, key=lambda n: (dist[n], n)):
+            if node == src:
+                continue
+            best = None
+            for p, w in g[node].items():
+                if p in dist and dist[p] + w == dist[node]:
+                    if best is None or (dist[p], p) < (dist[best], best):
+                        best = p
+            table[node] = node if best == src else table[best]
+        return table
+
+    def _tight(self, a, b, w):
+        """Is a->b, at cost w, on some shortest path to b?"""
+        d = self.dist
+        return a in d and b in d and d[a] + w == d[b]
+
+    def _has_other_pred(self, b, skip):
+        d, g = self.dist, self.graph
+        return any(p != skip and p in d and d[p] + w == d[b] for p, w in g[b].items())
 
     def link_change(self, a, b, cost):
-        raise NotImplementedError
+        """cost=None means the link went down."""
+        old = self.graph[a].get(b)
+        if cost is None:
+            self.graph[a].pop(b, None)
+            self.graph[b].pop(a, None)
+        else:
+            self.graph[a][b] = cost
+            self.graph[b][a] = cost
+        if old == cost:
+            return
+
+        worse = cost is None or (old is not None and cost > old)
+        if worse:
+            # Only a tight link can matter, and only if the far end loses its
+            # last shortest-path predecessor (then its cost, and everything
+            # downstream of it, grows).
+            for x, y in ((a, b), (b, a)):
+                if self._tight(x, y, old) and not self._has_other_pred(y, skip=x):
+                    return self._full()
+            self.table = self._table_from_dist()
+            return
+
+        # Link up, or cheaper: test it against the distances we already have.
+        d, inf = self.dist, float("inf")
+        improved = []
+        for x, y in ((a, b), (b, a)):
+            if x in d and d[x] + cost < d.get(y, inf):
+                d[y] = d[x] + cost
+                improved.append((d[y], y))
+        # Decrease-only relaxation from whatever got cheaper. Distances only
+        # fall, so this visits just the improved region, never the rest.
+        pq = improved
+        heapq.heapify(pq)
+        while pq:
+            dn, n = heapq.heappop(pq)
+            if dn > d[n]:
+                continue
+            for m, w in self.graph[n].items():
+                if dn + w < d.get(m, inf):
+                    d[m] = dn + w
+                    heapq.heappush(pq, (dn + w, m))
+        self.table = self._table_from_dist()
