@@ -72,8 +72,41 @@ class YourSwitch:
 
     BROADCAST = "ff:ff:ff:ff:ff:ff"
 
+    # Evidence kept: `demand`, how many times each MAC has appeared in a frame,
+    # as source *or* destination. Being a destination is what makes an entry
+    # worth having - a table hit is a flood avoided - so both count.
+    #
+    # Eviction: when full, drop the entry with the least demand (LFU), not the
+    # oldest. Admission: a newcomer only gets in if it has more demand than the
+    # entry it would replace; otherwise learning is declined and the table is
+    # left alone. A station heard once cannot push out one heard a thousand times.
+    #
+    # The counters live outside the table (a real switch would keep them in a
+    # small count-min sketch, as TinyLFU does). They hold no ports and are never
+    # used to forward, so they do not stretch `capacity`.
+
     def __init__(self, ports, capacity):
-        raise NotImplementedError("write your switch")
+        self.ports = ports
+        self.capacity = capacity
+        self.table = {}                            # mac -> port, <= capacity
+        self.demand = {}                           # mac -> frames seen
 
     def handle(self, frame, in_port):
-        raise NotImplementedError
+        src, dst, now = frame
+        d = self.demand
+        d[src] = d.get(src, 0) + 1
+        if dst != self.BROADCAST:
+            d[dst] = d.get(dst, 0) + 1
+
+        if src in self.table or len(self.table) < self.capacity:
+            self.table[src] = in_port              # refresh, or room to spare
+        else:
+            victim = min(self.table, key=lambda m: d.get(m, 0))
+            if d[src] > d.get(victim, 0):          # admit only if more useful
+                del self.table[victim]
+                self.table[src] = in_port
+
+        if dst == self.BROADCAST or dst not in self.table:
+            return [p for p in range(self.ports) if p != in_port]
+        out = self.table[dst]
+        return [] if out == in_port else [out]

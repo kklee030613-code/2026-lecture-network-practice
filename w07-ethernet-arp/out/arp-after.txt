@@ -1,0 +1,30 @@
+# arp -a after ping 172.16.24.1 + curl korea.ac.kr + gaia.cs.umass.edu, cache NOT cleared - path B.
+# Neighbor states from Get-NetNeighbor appended below.
+﻿
+인터페이스: 172.16.24.233 --- 0xe
+  인터넷 주소           물리적 주소           유형
+  172.16.0.7            d4-e8-80-b2-d9-8b     동적        
+  172.16.24.1           00-00-0c-07-ac-fa     동적        
+  172.16.24.255         ff-ff-ff-ff-ff-ff     정적        
+  224.0.0.22            01-00-5e-00-00-16     정적        
+  224.0.0.251           01-00-5e-00-00-fb     정적        
+  224.0.0.252           01-00-5e-00-00-fc     정적        
+  239.255.255.250       01-00-5e-7f-ff-fa     정적        
+  255.255.255.255       ff-ff-ff-ff-ff-ff     정적        
+
+# netsh interface ipv4 show neighbors (states) right after ping + curl:
+
+IPAddress       LinkLayerAddress        State
+---------       ----------------        -----
+127.0.0.1       00-00-00-00-00-00 Unreachable
+172.16.0.7      D4-E8-80-B2-D9-8B       Stale
+172.16.24.1     00-00-0C-07-AC-FA   Reachable
+172.16.24.255   FF-FF-FF-FF-FF-FF   Permanent
+224.0.0.22      01-00-5E-00-00-16   Permanent
+224.0.0.251     01-00-5E-00-00-FB   Permanent
+224.0.0.252     01-00-5E-00-00-FC   Permanent
+239.255.255.250 01-00-5E-7F-FF-FA   Permanent
+255.255.255.255 FF-FF-FF-FF-FF-FF   Permanent
+
+
+
